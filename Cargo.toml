@@ -22,6 +22,7 @@ wasi-experimental-http-wasmtime = { path = "crates/wasi-experimental-http-wasmti
 members = [
     "crates/wasi-experimental-http",
     "crates/wasi-experimental-http-wasmtime",
+    "crates/wasi-experimental-http-wasmer",
     "tests/rust"
 ]
 
