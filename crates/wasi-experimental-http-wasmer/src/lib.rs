@@ -2,6 +2,7 @@ use anyhow::Error;
 use bytes::Bytes;
 use futures::executor::block_on;
 use http::{header::HeaderName, HeaderMap, HeaderValue};
+use once_cell::sync::OnceCell;
 use reqwest::{Client, Method};
 use std::{
     collections::HashMap,
@@ -12,9 +13,9 @@ use std::{
 use tokio::runtime::Handle;
 use url::Url;
 use wasmer::{
-    Exports, Function, FunctionType, ImportObject, Memory, MemoryError, MemoryType, RuntimeError,
-    Store, Type, Val, Value, WasmerEnv,
+    Exports, Function, ImportObject, LazyInit, Memory, MemoryError, MemoryType, Store, WasmerEnv,
 };
+use wasmer_wasi::WasiEnv;
 
 const MEMORY: &str = "memory";
 
@@ -32,6 +33,15 @@ struct Response {
     headers: HeaderMap,
     body: Body,
 }
+
+struct GlobalState {
+    memory: Memory,
+    state: Arc<RwLock<State>>,
+    allowed_hosts: Option<Vec<String>>,
+    max_concurrent_requests: Option<u32>,
+}
+
+const GLOBAL_STATE: OnceCell<GlobalState> = OnceCell::new();
 
 /// Host state for the responses of the instance.
 #[derive(Default)]
@@ -93,26 +103,6 @@ impl From<HttpError> for u32 {
         }
     }
 }
-impl From<HttpError> for i32 {
-    fn from(e: HttpError) -> i32 {
-        match e {
-            HttpError::InvalidHandle(_) => 1,
-            HttpError::MemoryNotFound => 2,
-            HttpError::MemoryError(_) => 3,
-            HttpError::BufferTooSmall => 4,
-            HttpError::HeaderNotFound => 5,
-            HttpError::Utf8Error(_) => 6,
-            HttpError::DestinationNotAllowed(_) => 7,
-            HttpError::InvalidMethod => 8,
-            HttpError::InvalidEncoding => 9,
-            HttpError::InvalidUrl => 10,
-            HttpError::RequestError(_) => 11,
-            HttpError::RuntimeError => 12,
-            HttpError::TooManySessions => 13,
-            HttpError::FromUtf8Error(_) => 14,
-        }
-    }
-}
 
 impl From<PoisonError<std::sync::RwLockReadGuard<'_, State>>> for HttpError {
     fn from(_: PoisonError<std::sync::RwLockReadGuard<'_, State>>) -> Self {
@@ -141,24 +131,33 @@ impl HostCalls {
     // TODO (@radu-matei)
     // Fix the clippy warning.
     #[allow(clippy::unnecessary_wraps)]
-    fn close(st: Arc<RwLock<State>>, handle: WasiHttpHandle) -> Result<(), HttpError> {
-        let mut st = st.write()?;
+    fn close(Env { state, .. }: &Env, handle: WasiHttpHandle) -> Result<(), HttpError> {
+        let mut st = state.write()?;
         st.responses.remove(&handle);
         Ok(())
     }
 
+    // TODO use a macro for this
+    fn close_binding(env: &Env, handle: WasiHttpHandle) -> u32 {
+        match Self::close(env, handle) {
+            Ok(()) => 0,
+            Err(err) => err.into(),
+        }
+    }
     /// Read `buf_len` bytes from the response of `handle` and
     /// write them into `buf_ptr`.
     fn body_read(
-        st: Arc<RwLock<State>>,
-        memory: &Memory,
+        // st: Arc<RwLock<State>>,
+        // memory: &Memory,
         // mut store: impl AsContextMut,
+        Env { wasi_env, state }: &Env,
         handle: WasiHttpHandle,
         buf_ptr: u32,
         buf_len: u32,
         buf_read_ptr: u32,
     ) -> Result<(), HttpError> {
-        let mut st = st.write()?;
+        let memory = wasi_env.memory();
+        let mut st = state.write()?;
 
         let mut body = &mut st.responses.get_mut(&handle).unwrap().body;
         // let mut context = store.as_context_mut();
@@ -188,12 +187,29 @@ impl HostCalls {
         Ok(())
     }
 
+    fn body_read_binding(
+        // st: Arc<RwLock<State>>,
+        // memory: &Memory,
+        // mut store: impl AsContextMut,
+        env: &Env,
+        handle: WasiHttpHandle,
+        buf_ptr: u32,
+        buf_len: u32,
+        buf_read_ptr: u32,
+    ) -> u32 {
+        match Self::body_read(env, handle, buf_ptr, buf_len, buf_read_ptr) {
+            Ok(()) => 0,
+            Err(err) => err.into(),
+        }
+    }
+
     /// Get a response header value given a key.
     #[allow(clippy::too_many_arguments)]
     fn header_get(
-        st: Arc<RwLock<State>>,
+        // st: Arc<RwLock<State>>,
         // mut store: impl AsContextMut,
-        memory: &Memory,
+        // memory: &Memory,
+        Env { wasi_env, state }: &Env,
         handle: WasiHttpHandle,
         name_ptr: u32,
         name_len: u32,
@@ -201,7 +217,10 @@ impl HostCalls {
         value_len: u32,
         value_written_ptr: u32,
     ) -> Result<(), HttpError> {
-        let st = st.read()?;
+        println!("header_get");
+        let memory = wasi_env.memory();
+
+        let st = state.read()?;
 
         // Get the current response headers.
         let headers = &st
@@ -240,16 +259,46 @@ impl HostCalls {
         Ok(())
     }
 
-    fn headers_get_all(
-        st: Arc<RwLock<State>>,
-        memory: &Memory,
+    fn header_get_binding(
+        // st: Arc<RwLock<State>>,
         // mut store: impl AsContextMut,
+        // memory: &Memory,
+        env: &Env,
+
+        handle: WasiHttpHandle,
+        name_ptr: u32,
+        name_len: u32,
+        value_ptr: u32,
+        value_len: u32,
+        value_written_ptr: u32,
+    ) -> u32 {
+        match Self::header_get(
+            env,
+            handle,
+            name_ptr,
+            name_len,
+            value_ptr,
+            value_len,
+            value_written_ptr,
+        ) {
+            Ok(()) => 0,
+            Err(err) => err.into(),
+        }
+    }
+
+    fn headers_get_all(
+        // st: Arc<RwLock<State>>,
+        // memory: &Memory,
+        // mut store: impl AsContextMut,
+        Env { wasi_env, state }: &Env,
         handle: WasiHttpHandle,
         buf_ptr: u32,
         buf_len: u32,
         buf_written_ptr: u32,
     ) -> Result<(), HttpError> {
-        let st = st.read()?;
+        println!("header_get_all");
+        let st = state.read()?;
+        let memory = wasi_env.memory();
 
         let headers = &st
             .responses
@@ -285,14 +334,29 @@ impl HostCalls {
         Ok(())
     }
 
+    fn headers_get_all_binding(
+        // st: Arc<RwLock<State>>,
+        // memory: &Memory,
+        // mut store: impl AsContextMut,
+        env: &Env,
+        handle: WasiHttpHandle,
+        buf_ptr: u32,
+        buf_len: u32,
+        buf_written_ptr: u32,
+    ) -> u32 {
+        match Self::headers_get_all(env, handle, buf_ptr, buf_len, buf_written_ptr) {
+            Ok(_) => 0,
+            Err(err) => err.into(),
+        }
+    }
+
     /// Execute a request for a guest module, given
     /// the request data.
     #[allow(clippy::too_many_arguments)]
     fn req(
-        st: Arc<RwLock<State>>,
-        allowed_hosts: Option<&[String]>,
-        max_concurrent_requests: Option<u32>,
-        memory: &Memory,
+        Env { wasi_env, state }: &Env,
+        // allowed_hosts: Option<&[String]>,
+        // max_concurrent_requests: Option<u32>,
         // mut store: impl AsContextMut,
         url_ptr: u32,
         url_len: u32,
@@ -305,30 +369,50 @@ impl HostCalls {
         status_code_ptr: u32,
         res_handle_ptr: u32,
     ) -> Result<(), HttpError> {
+        println!("req called");
+        // let state = GLOBAL_STATE
+        //     .get()
+        //     .expect("cannot get global state")
+        //     .state
+        //     .clone();
+        // let memory = GLOBAL_STATE
+        //     .get()
+        //     .expect("cannot get global state")
+        //     .memory
+        //     .clone();
+        let memory = wasi_env.memory();
+        let allowed_hosts: Option<Vec<String>> = None;
+        let max_concurrent_requests: Option<usize> = None;
+
         let span = tracing::trace_span!("req");
         let _enter = span.enter();
+        println!("req ===========");
 
-        let mut st = st.write()?;
+        let mut st = state.write()?;
+
         if let Some(max) = max_concurrent_requests {
             if st.responses.len() > (max - 1) as usize {
                 return Err(HttpError::TooManySessions);
             }
         };
+        println!("req !!!!!!!!!!!!!!!");
 
         // let mut store = store.as_context_mut();
 
         // Read the request parts from the module's linear memory and check early if
         // the guest is allowed to make a request to the given URL.
-        let url = string_from_memory(memory, url_ptr, url_len)?;
-        if !is_allowed(url.as_str(), allowed_hosts)? {
+        let url = string_from_memory(&memory, url_ptr, url_len)?;
+        println!("url --- {}", url);
+        if !is_allowed(url.as_str(), allowed_hosts.as_ref())? {
             return Err(HttpError::DestinationNotAllowed(url));
         }
 
-        let method = Method::from_str(string_from_memory(memory, method_ptr, method_len)?.as_str())
-            .map_err(|_| HttpError::InvalidMethod)?;
-        let req_body = slice_from_memory(memory, req_body_ptr, req_body_len)?;
+        let method =
+            Method::from_str(string_from_memory(&memory, method_ptr, method_len)?.as_str())
+                .map_err(|_| HttpError::InvalidMethod)?;
+        let req_body = slice_from_memory(&memory, req_body_ptr, req_body_len)?;
         let headers = string_to_header_map(
-            string_from_memory(memory, req_headers_ptr, req_headers_len)?.as_str(),
+            string_from_memory(&memory, req_headers_ptr, req_headers_len)?.as_str(),
         )
         .map_err(|_| HttpError::InvalidEncoding)?;
 
@@ -374,6 +458,40 @@ impl HostCalls {
 
         Ok(())
     }
+
+    fn req_binding(
+        env: &Env,
+        // allowed_hosts: Option<&[String]>,
+        // max_concurrent_requests: Option<u32>,
+        // mut store: impl AsContextMut,
+        url_ptr: u32,
+        url_len: u32,
+        method_ptr: u32,
+        method_len: u32,
+        req_headers_ptr: u32,
+        req_headers_len: u32,
+        req_body_ptr: u32,
+        req_body_len: u32,
+        status_code_ptr: u32,
+        res_handle_ptr: u32,
+    ) -> u32 {
+        match Self::req(
+            env,
+            url_ptr,
+            url_len,
+            method_ptr,
+            method_len,
+            req_headers_ptr,
+            req_headers_len,
+            req_body_ptr,
+            req_body_len,
+            status_code_ptr,
+            res_handle_ptr,
+        ) {
+            Ok(_) => 0,
+            Err(err) => err.into(),
+        }
+    }
 }
 
 /// Experimental HTTP extension object for Wasmtime.
@@ -381,6 +499,12 @@ pub struct HttpCtx {
     state: Arc<RwLock<State>>,
     allowed_hosts: Arc<Option<Vec<String>>>,
     max_concurrent_requests: Option<u32>,
+}
+
+#[derive(WasmerEnv, Clone)]
+struct Env {
+    state: Arc<RwLock<State>>,
+    wasi_env: WasiEnv,
 }
 
 impl HttpCtx {
@@ -407,122 +531,123 @@ impl HttpCtx {
     pub fn add_to_import_object(
         &self,
         store: &Store,
+        wasi_env: WasiEnv,
         import_object: &mut ImportObject,
     ) -> Result<(), Error> {
+        // let mem = Memory::new(store, MemoryType::new(10, None, false))?;
+        // mem.grow(1000)?;
+        // println!("memory --- {:?}", mem);
+        // let mem = wasi_env.memory();
+
         let st = self.state.clone();
         let mut env = Exports::new();
 
-        let close = move |handle: WasiHttpHandle| -> u32 {
-            match HostCalls::close(st.clone(), handle) {
-                Ok(()) => 0,
-                Err(e) => e.into(),
-            }
-        };
-        let func = Function::new_native(store, close);
+        // let close = move |handle: WasiHttpHandle| -> u32 {
+        //     match HostCalls::close(st.clone(), handle) {
+        //         Ok(()) => 0,
+        //         Err(e) => e.into(),
+        //     }
+        // };
+        // let memory = mem.clone();
+        let func = Function::new_native_with_env(
+            store,
+            Env {
+                wasi_env: wasi_env.clone(),
+                state: st,
+            },
+            HostCalls::close_binding,
+        );
         env.insert("close", func);
+        println!("close added");
 
         // ----------------------------------------------------------
 
-        #[derive(WasmerEnv, Clone)]
-        struct Env {
-            memory: Memory,
-        }
-
         let st = self.state.clone();
-        let body_read = move |ctx: &Env, args: &[Val]| -> Result<Vec<Val>, RuntimeError> {
-            match HostCalls::body_read(
-                st.clone(),
-                &ctx.memory,
-                args[0].unwrap_i32() as u32,
-                args[1].unwrap_i32() as u32,
-                args[2].unwrap_i32() as u32,
-                args[3].unwrap_i32() as u32,
-            ) {
-                Ok(()) => Ok(vec![Val::I32(0)]),
-                Err(e) => Ok(vec![Val::I32(e.into())]),
-            }
-        };
-        let mem = Memory::new(store, MemoryType::new(1, None, false))?;
-        let signature = FunctionType::new(
-            vec![Type::I32, Type::I32, Type::I32, Type::I32],
-            vec![Type::I32],
-        );
-        let func = Function::new_with_env(
+        // let memory = mem.clone();
+        // let body_read = move |handle: WasiHttpHandle,
+        //                       buf_ptr: u32,
+        //                       buf_len: u32,
+        //                       buf_read_ptr: u32|
+        //       -> u32 {
+        //     match HostCalls::body_read(st.clone(), &memory, handle, buf_ptr, buf_len, buf_read_ptr)
+        //     {
+        //         Ok(()) => 0,
+        //         Err(e) => e.into(),
+        //     }
+        // };
+        let func = Function::new_native_with_env(
             store,
-            &signature,
             Env {
-                memory: mem.clone(),
+                wasi_env: wasi_env.clone(),
+                state: st,
             },
-            body_read,
+            HostCalls::body_read_binding,
         );
         env.insert("body_read", func);
 
         // ----------------------------------------------------------
 
         let st = self.state.clone();
-        let header_get = move |ctx: &Env, args: &[Val]| -> Result<Vec<Val>, RuntimeError> {
-            match HostCalls::header_get(
-                st.clone(),
-                &ctx.memory,
-                args[0].unwrap_i32() as u32,
-                args[1].unwrap_i32() as u32,
-                args[2].unwrap_i32() as u32,
-                args[3].unwrap_i32() as u32,
-                args[4].unwrap_i32() as u32,
-                args[5].unwrap_i32() as u32,
-            ) {
-                Ok(()) => Ok(vec![Val::I32(0)]),
-                Err(e) => Ok(vec![Val::I32(e.into())]),
-            }
-        };
-        let signature = FunctionType::new(
-            vec![
-                Type::I32,
-                Type::I32,
-                Type::I32,
-                Type::I32,
-                Type::I32,
-                Type::I32,
-            ],
-            vec![Type::I32],
-        );
-        let func = Function::new_with_env(
+        // let memory = mem.clone();
+        // let header_get = move |handle: WasiHttpHandle,
+        //                        name_ptr: u32,
+        //                        name_len: u32,
+        //                        value_ptr: u32,
+        //                        value_len: u32,
+        //                        value_written_ptr: u32|
+        //       -> u32 {
+        //     match HostCalls::header_get(
+        //         st.clone(),
+        //         &memory,
+        //         handle,
+        //         name_ptr,
+        //         name_len,
+        //         value_ptr,
+        //         value_len,
+        //         value_written_ptr,
+        //     ) {
+        //         Ok(()) => 0,
+        //         Err(e) => e.into(),
+        //     }
+        // };
+
+        let func = Function::new_native_with_env(
             store,
-            &signature,
             Env {
-                memory: mem.clone(),
+                wasi_env: wasi_env.clone(),
+                state: st,
             },
-            header_get,
+            HostCalls::header_get_binding,
         );
         env.insert("header_get", func);
 
         // ----------------------------------------------------------
 
         let st = self.state.clone();
-        let headers_get_all = move |ctx: &Env, args: &[Val]| -> Result<Vec<Val>, RuntimeError> {
-            match HostCalls::headers_get_all(
-                st.clone(),
-                &ctx.memory,
-                args[0].unwrap_i32() as u32,
-                args[1].unwrap_i32() as u32,
-                args[2].unwrap_i32() as u32,
-                args[3].unwrap_i32() as u32,
-            ) {
-                Ok(()) => Ok(vec![Val::I32(0)]),
-                Err(e) => Ok(vec![Val::I32(e.into())]),
-            }
-        };
-        let signature = FunctionType::new(
-            vec![Type::I32, Type::I32, Type::I32, Type::I32],
-            vec![Type::I32],
-        );
-        let func = Function::new_with_env(
+        // let memory = mem.clone();
+
+        // let headers_get_all =
+        //     move |handle: WasiHttpHandle, buf_ptr: u32, buf_len: u32, buf_read_ptr: u32| -> u32 {
+        //         match HostCalls::headers_get_all(
+        //             st.clone(),
+        //             &memory,
+        //             handle,
+        //             buf_ptr,
+        //             buf_len,
+        //             buf_read_ptr,
+        //         ) {
+        //             Ok(()) => 0,
+        //             Err(e) => e.into(),
+        //         }
+        //     };
+
+        let func = Function::new_native_with_env(
             store,
-            &signature,
             Env {
-                memory: mem.clone(),
+                state: st,
+                wasi_env: wasi_env.clone(),
             },
-            headers_get_all,
+            HostCalls::headers_get_all_binding,
         );
         env.insert("headers_get_all", func);
 
@@ -531,56 +656,20 @@ impl HttpCtx {
         let allowed_hosts = self.allowed_hosts.clone();
         let max_concurrent_requests = self.max_concurrent_requests;
         let st = self.state.clone();
-        let req = move |ctx: &Env, args: &[Val]| -> Result<Vec<Val>, RuntimeError> {
-            match HostCalls::req(
-                st.clone(),
-                allowed_hosts.as_deref(),
-                max_concurrent_requests,
-                &ctx.memory,
-                args[0].unwrap_i32() as u32,
-                args[1].unwrap_i32() as u32,
-                args[2].unwrap_i32() as u32,
-                args[3].unwrap_i32() as u32,
-                args[4].unwrap_i32() as u32,
-                args[5].unwrap_i32() as u32,
-                args[6].unwrap_i32() as u32,
-                args[7].unwrap_i32() as u32,
-                args[8].unwrap_i32() as u32,
-                args[9].unwrap_i32() as u32,
-            ) {
-                Ok(()) => Ok(vec![Val::I32(0)]),
-                Err(e) => Ok(vec![Val::I32(e.into())]),
-            }
-        };
-        let signature = FunctionType::new(
-            vec![
-                Type::I32,
-                Type::I32,
-                Type::I32,
-                Type::I32,
-                Type::I32,
-                Type::I32,
-                Type::I32,
-                Type::I32,
-                Type::I32,
-                Type::I32,
-            ],
-            vec![Type::I32],
-        );
-
-        let func = Function::new_with_env(
+        // let memory = mem.clone();
+        let func = Function::new_native_with_env(
             store,
-            &signature,
             Env {
-                memory: mem.clone(),
+                state: st,
+                wasi_env: wasi_env.clone(),
             },
-            req,
+            HostCalls::req_binding,
         );
         env.insert("req", func);
 
         // ----------------------------------------------------------
 
-        import_object.register("env", env);
+        import_object.register(Self::MODULE, env);
 
         Ok(())
     }
@@ -646,11 +735,26 @@ fn request(
 /// This will return an `HttpError::BufferTooSmall` if the size of the
 /// requested slice is larger than the memory size.
 fn slice_from_memory(memory: &Memory, offset: u32, len: u32) -> Result<Vec<u8>, HttpError> {
+    println!("==== offset {} and len {}", offset, len);
+
     let required_memory_size = offset.checked_add(len).ok_or(HttpError::BufferTooSmall)? as usize;
+    // memory.grow(10)?;
+    println!(
+        ":::::::::: offset {} and len {} ---- memory size {}",
+        offset,
+        len,
+        memory.data_size()
+    );
 
     if required_memory_size > memory.data_size() as usize {
         return Err(HttpError::BufferTooSmall);
     }
+    println!("slice_from_memory {:?}", unsafe {
+        memory.data_unchecked().len()
+    });
+    println!("slice_from_memory {:?}", unsafe {
+        unsafe { &memory.data_unchecked()[(offset as usize)..(offset as usize) + len as usize] }
+    });
 
     Ok(
         unsafe { &memory.data_unchecked()[(offset as usize)..(offset as usize) + len as usize] }
@@ -660,14 +764,15 @@ fn slice_from_memory(memory: &Memory, offset: u32, len: u32) -> Result<Vec<u8>, 
 
 /// Read a string of byte length `len` from `memory`, starting at `offset`.
 fn string_from_memory(memory: &Memory, offset: u32, len: u32) -> Result<String, HttpError> {
-    let slice = slice_from_memory(memory, offset, len)?;
+    println!("offset {} and len {}", offset, len);
+    let slice = slice_from_memory(&memory, offset, len)?;
     Ok(std::str::from_utf8(&slice)?.to_string())
 }
 
 /// Check if guest module is allowed to send request to URL, based on the list of
 /// allowed hosts defined by the runtime.
 /// If `None` is passed, the guest module is not allowed to send the request.
-fn is_allowed(url: &str, allowed_hosts: Option<&[String]>) -> Result<bool, HttpError> {
+fn is_allowed(url: &str, allowed_hosts: Option<&Vec<String>>) -> Result<bool, HttpError> {
     let url_host = Url::parse(url)
         .map_err(|_| HttpError::InvalidUrl)?
         .host_str()
