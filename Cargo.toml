@@ -1,22 +1,26 @@
 [package]
-name = "wasi-experimental-http-wasmtime-sample"
-version = "0.5.0"
-authors = ["Radu Matei <radu.matei@microsoft.com>"]
-edition = "2018"
+    name    = "wasi-experimental-http-wasmtime-sample"
+    version = "0.7.0"
+    authors = [ "Radu Matei <radu.matei@microsoft.com>" ]
+    edition = "2021"
 
 [dependencies]
-anyhow = "1.0"
-futures = "0.3"
-http = "0.2"
-reqwest = { version = "0.11", default-features = true, features = ["json", "blocking"] }
-structopt = "0.3.21"
-tokio = { version = "1.4.0", features = ["full"] }
-wasmtime = "0.28.0"
-wasmtime-wasi = "0.28.0"
-wasi-common = "0.28.0"
-wasi-cap-std-sync = "0.28.0"
-wasi-experimental-http = { path = "crates/wasi-experimental-http" }
-wasi-experimental-http-wasmtime = { path = "crates/wasi-experimental-http-wasmtime" }
+    anyhow = "1.0"
+    futures = "0.3"
+    http = "0.2"
+    reqwest = { version = "0.11", default-features = true, features = [
+        "json",
+        "blocking",
+    ] }
+    structopt = "0.3"
+    tokio = { version = "1.4", features = [ "full" ] }
+    wasmtime = "0.31"
+    wasmtime-wasi = "0.31"
+    wasi-common = "0.31"
+    wasi-cap-std-sync = "0.31"
+    wasi-experimental-http = { path = "crates/wasi-experimental-http" }
+    wasi-experimental-http-wasmtime = { path = "crates/wasi-experimental-http-wasmtime" }
+    wasi-experimental-http-wasmer = { path = "crates/wasi-experimental-http-wasmer" }
 
 [workspace]
 members = [
@@ -27,5 +31,5 @@ members = [
 ]
 
 [[bin]]
-name = "wasmtime-http"
-path = "bin/wasmtime-http.rs"
+    name = "wasmtime-http"
+    path = "bin/wasmtime-http.rs"
